@@ -1,0 +1,37 @@
+Running mimic command:
+
+Assumptions:
+- Produce at most 20 word long sentences, to minimize strain on queries.
+
+Algorithm:
+1. Check if the mentioned user is a member of the server using serenity. If they are, proceed to step 2; if not, reply with specified user is not a member of the server.
+
+2. Check if the member is a member which we have information about. This would be done by querying the members table:
+
+select member_id from members where server_id == "server" and user_id == "user";
+
+if they are a member which we know about, proceed to step 3; else, reply with "I don't know who that is."
+
+3. Generate a random integer between 4 and 20 inclusive on both bounds. This will be the desired length of the sentence, and will be stored in the variable desired_sentence_length
+
+4. Select a random word that that member has said. This would be done by querying the member_words table:
+
+select word_id from members_words where member_id == "member" order by random() limit 1;
+
+This above query might get slow for large member_words table.
+
+If we get a value, continue to step 5; else, reply with "I haven't learned enough about this member yet."
+
+5. get the sum of the frequencies of words that member has said. This would be done by querying the member_words table:
+
+select sum(frequency) from member_words where member_id == "member";
+
+Store this value as the total_frequency variable, so that we can take a probability later.
+
+6. Initialize a vector of type u32. Call it word_ids. Add the first word_id to this vector.
+
+7. Now, in a for loop over an iterator from 0..desired_sentence_length with item i:
+
+perform an sql query in each loop iteration of the following form:
+
+
