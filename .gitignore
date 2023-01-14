@@ -1,4 +1,7 @@
 /target
-/db
+/db/root
+/db/history.txt
 /.env
-/db2
+/db2/data
+/db2/logs
+/db2/history.txt
