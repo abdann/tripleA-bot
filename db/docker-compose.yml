@@ -1,8 +1,9 @@
 version: '3.8'
 
 services:
-  db:
-    image: postgres:14.1-alpine
+  triple-a-bot-db:
+    container_name: triple-a-db
+    image: postgres:latest
     restart: always
     environment:
       - POSTGRES_USER=postgres
@@ -10,4 +11,4 @@ services:
     ports:
       - 8001:5432
     volumes:
-      - /home/omfi/tripleA-bot/db/root:/var/lib/postgresql/data
+      - ./root:/var/lib/postgresql/data

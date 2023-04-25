@@ -1,8 +1,10 @@
 use crate::client::database::errors;
+use crate::client::textgen::textprocessing;
 use itertools::Itertools;
 use serenity::prelude::{Mutex, TypeMapKey};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /** The DDL for the database schema */
@@ -445,14 +447,33 @@ impl DbInterface {
     }
 
     /** Adds a vector of words to known words. Expects words to be pre-processed. */
-    pub async fn add_words(&self, words: Vec<String>) -> Result<(), sqlx::Error> {
-        sqlx::query!(
-            "INSERT INTO words(word) SELECT * FROM UNNEST($1::text[]) ON CONFLICT DO NOTHING",
+    pub async fn add_words(&self, words: Vec<String>) -> Result<Vec<i32>, sqlx::Error> {
+        let results = sqlx::query!(
+            "INSERT INTO words(word) SELECT * FROM UNNEST($1::text[]) ON CONFLICT DO NOTHING RETURNING word_id",
             &words[..]
         )
-        .execute(&self.db.clone())
+        .fetch_all(&self.db.clone())
         .await?;
-        Ok(())
+        if results.len() != words.len() {
+            // If we don't insert all the words, our query is empty; therefore we need to select the data and map it to the words to get the right order
+            let found_words = sqlx::query!(
+                "SELECT word_id, word FROM words WHERE word = ANY($1)",
+                &words[..]
+            )
+            .fetch_all(&self.db)
+            .await?;
+            // Now make it into a dictionary for easy access to the word_id values:
+            let mut found_words = HashMap::from_iter(
+                found_words
+                    .into_iter()
+                    .map(|record| (record.word, record.word_id)),
+            );
+            let mut returnable = vec![];
+            for word in words {
+                returnable.push(found_words.get(&word).unwrap_or(&0)); // 0 for failure
+            }
+        }
+        Ok(results.into_iter().map(|f| f.word_id).collect_vec())
     }
 
     // Adds member words
@@ -461,12 +482,25 @@ impl DbInterface {
         member_id: u32,
         member_words: Vec<String>,
     ) -> Result<(), errors::AddMemberWordsError> {
-        // Expect member_words to be a list of words where each word follows the next
-        todo!()
+        let member_word_ids = self.add_words(member_words).await?;
+        println!("member_word_ids: {:?}", member_word_ids);
+        let word_pairs = textprocessing::vec_word_split(member_word_ids);
+        println!("word_pairs: {:?}", word_pairs);
+        for insertable in word_pairs {
+            sqlx::query!("INSERT INTO member_words (word_id, member_id, next_word_id, frequency) VALUES ($1, $2, $3, 1)
+             ON CONFLICT (word_id, member_id, next_word_id) DO UPDATE SET frequency = member_words.frequency + 1;",
+            &insertable[0],
+            member_id as i32,
+            &insertable[1]).execute(&self.db).await?;
+            println!("word_id: {:?}", &insertable[0]);
+            println!("member_id: {:?}", member_id);
+            println!("next_word_id: {:?}", &insertable[1]);
+        }
+        Ok(())
     }
 
     /** deletes all data from all tables. For testing only, Do not use on production. */
-    async fn reinit_all_data(&self) -> Result<bool, sqlx::Error> {
+    pub async fn reinit_all_data(&self) -> Result<bool, sqlx::Error> {
         //Don't want to have to split this up into multiple queries, but I guess I have to...
         sqlx::query!("DROP SCHEMA public CASCADE;")
             .execute(&self.db.clone())
@@ -541,7 +575,8 @@ impl DbInterface {
             word_id INTEGER NOT NULL REFERENCES words (word_id) ON DELETE CASCADE,
             member_id INTEGER NOT NULL REFERENCES members (member_id) ON DELETE CASCADE,
             next_word_id INTEGER NOT NULL REFERENCES words (word_id) ON DELETE CASCADE,
-            frequency BIGINT NOT NULL
+            frequency BIGINT NOT NULL,
+            PRIMARY KEY (word_id, member_id, next_word_id)
         );"
         )
         .execute(&self.db.clone())
@@ -549,393 +584,4 @@ impl DbInterface {
 
         Ok(true)
     }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-
-    #[tokio::test]
-    async fn test_fetch_tracked_user_members() {
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-
-        db_int.add_tracked_member(123, 456).await;
-        db_int.add_tracked_member(123, 789).await;
-        db_int.add_tracked_member(456, 123).await;
-        let result1 = {
-            match db_int.fetch_tracked_user_members(123).await {
-                Ok(results) => {
-                    if let Some(list_of_members) = results {
-                        list_of_members
-                    } else {
-                        vec![]
-                    }
-                }
-                Err(_why) => {
-                    vec![]
-                }
-            }
-        };
-        assert_eq!(result1, vec![456, 789]);
-        db_int
-            .reinit_all_data()
-            .await
-            .expect("Clear data after test");
-    }
-    #[tokio::test]
-    async fn test_reinit_db() {
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-
-        db_int
-            .add_tracked_member(123, 456)
-            .await
-            .expect("Add member");
-
-        db_int.reinit_all_data().await.expect("cleared data");
-        let remaining_rows = sqlx::query!("SELECT * FROM tracked_members;")
-            .fetch_all(&db_int.db.clone())
-            .await
-            .expect("Got selection")
-            .len();
-
-        assert_eq!(0, remaining_rows);
-    }
-    /** Tests inserting a new tracked member if the member is not already a tracked member and is not already a stored member and is not already a stored user */
-    #[tokio::test]
-    async fn test_insert_tracked_member_no_user_no_member() {
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-
-        let first_result = db_int
-            .add_tracked_member(1056949566718607391, 611962779762688020)
-            .await.expect("Should be able to insert a new tracked member if the database does not have any information about that user.");
-        assert_eq!(errors::InsertResult::Added, first_result);
-
-        db_int
-            .reinit_all_data()
-            .await
-            .expect("Clear data after test");
-    }
-
-    #[tokio::test]
-    async fn test_insert_tracked_member_with_user_already_present() {
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-
-        //Add the user here
-        sqlx::query!(
-            "INSERT INTO users(user_id) VALUES ($1)",
-            611962779762688020 as i64
-        )
-        .execute(&db_int.db.clone())
-        .await
-        .expect("Should be able to place user prior to test");
-
-        let first_result = db_int
-            .add_tracked_member(1056949566718607391, 611962779762688020)
-            .await
-            .expect("Should be able to insert a new tracked member if the user already exists.");
-        assert_eq!(errors::InsertResult::Added, first_result);
-        db_int
-            .reinit_all_data()
-            .await
-            .expect("Clear data after test");
-    }
-
-    #[tokio::test]
-    async fn test_insert_tracked_member_with_user_already_present_with_member_already_present() {
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-        sqlx::query!(
-            "INSERT INTO users(user_id) VALUES ($1)",
-            611962779762688020 as i64
-        )
-        .execute(&db_int.db.clone())
-        .await
-        .expect("Should be able to add a user.");
-        sqlx::query!(
-            "INSERT INTO servers(server_id) VALUES ($1)",
-            1056949566718607391 as i64
-        )
-        .execute(&db_int.db.clone())
-        .await
-        .expect("Should be able to add a server.");
-        sqlx::query!(
-            "INSERT INTO members(server_id, user_id) VALUES ($1, $2)",
-            1056949566718607391 as i64,
-            611962779762688020 as i64
-        )
-        .execute(&db_int.db.clone())
-        .await
-        .expect("Inserted row.");
-
-        let first_result = db_int
-            .add_tracked_member(1056949566718607391, 611962779762688020)
-            .await
-            .expect("Should be able to add tracked member.");
-        assert_eq!(errors::InsertResult::Added, first_result);
-
-        //Now rollback changes
-        db_int
-            .reinit_all_data()
-            .await
-            .expect("Clear data after test");
-    }
-
-    #[tokio::test]
-    async fn test_insert_tracked_member_with_user_already_present_with_member_already_present_with_tracked_member_already_present(
-    ) {
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-
-        sqlx::query!(
-            "INSERT INTO users(user_id) VALUES ($1)",
-            611962779762688020 as i64
-        )
-        .execute(&db_int.db.clone())
-        .await
-        .expect("Should be able to add a user.");
-        sqlx::query!(
-            "INSERT INTO servers(server_id) VALUES ($1)",
-            1056949566718607391 as i64
-        )
-        .execute(&db_int.db.clone())
-        .await
-        .expect("Should be able to add a server.");
-        let member_id = sqlx::query!(
-            "INSERT INTO members(server_id, user_id) VALUES ($1, $2) RETURNING *;",
-            1056949566718607391 as i64,
-            611962779762688020 as i64
-        )
-        .fetch_one(&db_int.db.clone())
-        .await
-        .expect("Inserted row.")
-        .member_id;
-        sqlx::query!(
-            "INSERT INTO tracked_members(member_id) VALUES ($1)",
-            member_id
-        )
-        .execute(&db_int.db.clone())
-        .await
-        .expect("Should be able to add tracked member");
-
-        let first_result = db_int
-            .add_tracked_member(1056949566718607391, 611962779762688020)
-            .await
-            .expect("Should be able to add tracked member");
-        assert_eq!(errors::InsertResult::AlreadyPresent, first_result);
-        db_int
-            .reinit_all_data()
-            .await
-            .expect("Clear data after test");
-    }
-
-    #[tokio::test]
-    async fn test_add_tracked_channel_not_present() {
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-        db_int
-            .reinit_all_data()
-            .await
-            .expect("Clear data after test");
-
-        let result = db_int
-            .add_tracked_channel(1056949566718607391, 1056949567561674808)
-            .await
-            .expect("Should be able to add tracked channel");
-        assert_eq!(errors::InsertResult::Added, result);
-        db_int
-            .reinit_all_data()
-            .await
-            .expect("Clear data after test");
-    }
-
-    #[tokio::test]
-    async fn test_add_tracked_channel_present() {
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-
-        //Add channel beforehand
-        let first_result = db_int
-            .add_tracked_channel(1056949566718607391, 1056949567561674808)
-            .await
-            .expect("Should be able to add tracked channel");
-        assert_eq!(errors::InsertResult::Added, first_result);
-        let second_result = db_int
-            .add_tracked_channel(1056949566718607391, 1056949567561674808)
-            .await
-            .expect("Should be able to add tracked channel");
-        assert_eq!(errors::InsertResult::AlreadyPresent, second_result);
-        db_int
-            .reinit_all_data()
-            .await
-            .expect("Clear data after test");
-    }
-
-    #[tokio::test]
-    async fn test_remove_tracked_channel_not_present() {
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-
-        let result = db_int
-            .remove_tracked_channel(1056949566718607391, 1056949567561674808)
-            .await
-            .expect("Should be able to add tracked channel");
-        assert_eq!(errors::RemoveResult::NotPresent, result);
-        db_int
-            .reinit_all_data()
-            .await
-            .expect("Clear data after test");
-    }
-
-    #[tokio::test]
-    async fn test_remove_tracked_channel_present() {
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-        //Add channel beforehand
-        db_int
-            .add_tracked_channel(1056949566718607391, 1056949567561674808)
-            .await
-            .expect("Should be able to add tracked channel");
-        let result = db_int
-            .remove_tracked_channel(1056949566718607391, 1056949567561674808)
-            .await
-            .expect("Should be able to add tracked channel");
-        assert_eq!(errors::RemoveResult::Removed, result);
-        db_int
-            .reinit_all_data()
-            .await
-            .expect("Clear data after test");
-    }
-
-    #[tokio::test]
-    async fn test_add_words_no_words_present() {
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-
-        let sample_words = vec![
-            "test1".to_string(),
-            "test2".to_string(),
-            "test3".to_string(),
-        ];
-        // Add words
-        db_int.add_words(sample_words).await.expect("adding words.");
-        assert!(true);
-        db_int
-            .reinit_all_data()
-            .await
-            .expect("Clear data after test");
-    }
-
-    #[tokio::test]
-    async fn test_add_words_some_words_present() {
-        // Tests if you can add words when some words are present. Note: this tests Non-overlapping words only.
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-
-        let sample_words_1 = vec![
-            "test1".to_string(),
-            "test2".to_string(),
-            "test3".to_string(),
-        ];
-
-        let sample_words_2 = vec![
-            "test4".to_string(),
-            "test5".to_string(),
-            "test6".to_string(),
-        ];
-
-        db_int
-            .add_words(sample_words_1)
-            .await
-            .expect("Added first words");
-
-        db_int
-            .add_words(sample_words_2)
-            .await
-            .expect("Added second words");
-
-        db_int.reinit_all_data().await.expect("reinit");
-        assert!(true);
-    }
-
-    #[tokio::test]
-    async fn test_add_words_some_words_present_overlap() {
-        // Tests if you can add words when some words are present. Note: This *does* test overlap when trying to insert words that are already present
-        dotenv::dotenv().expect("Should be able to get .env file");
-        let db_url: String =
-            std::env::var("DATABASE_URL").expect("Should be able to get database url");
-        let db_int = DbInterface::new(&db_url).await;
-
-        let sample_words_1 = vec![
-            "test1".to_string(),
-            "test2".to_string(),
-            "test4".to_string(),
-        ];
-
-        let sample_words_2 = vec![
-            "test4".to_string(),
-            "test5".to_string(),
-            "test6".to_string(),
-        ];
-
-        db_int
-            .add_words(sample_words_1)
-            .await
-            .expect("Added first words");
-
-        db_int
-            .add_words(sample_words_2)
-            .await
-            .expect("Added second words");
-
-        db_int.reinit_all_data().await.expect("reinit");
-        assert!(true);
-    }
-
-    // #[tokio::test]
-    // async fn test_schema_output() {
-    //     use std::env;
-    //     dotenv::dotenv().expect("We should be able to load a .env file.");
-    //     let db_url: String =
-    //         env::var("DATABASE_URL").expect("We should have the database url in the .env file.");
-    //     let mut db_interface = DbInterface::new(&db_url).await;
-    //     match db_interface.check_db_schema().await {
-    //         Ok(state) => {
-    //             println!("Database found, the schema is {:?}", state);
-    //             assert!(true);
-    //         }
-    //         Err(why) => {
-    //             println!("SQLx error: {:?}", why);
-    //             assert!(false);
-    //         }
-    //     }
-    // }
 }

@@ -1,14 +1,10 @@
 use serde::{Deserialize, Serialize};
-use surreal_simple_querybuilder::prelude::*;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Server {
     pub server_id: u64,
 }
 
-model!(Server {
-    pub server_id
-});
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Users {
     pub user_id: u64,
