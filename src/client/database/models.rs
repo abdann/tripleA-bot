@@ -38,7 +38,7 @@ pub struct NewMember {
     pub server_id: i64,
 }
 
-#[derive(Queryable, Identifiable, Associations)]
+#[derive(Queryable, Identifiable, Associations, Insertable)]
 #[diesel(belongs_to(Member))]
 #[diesel(table_name = tracked_members)]
 #[diesel(primary_key(member_id))]
@@ -47,21 +47,46 @@ pub struct TrackedMember {
     pub id: i32,
 }
 
-#[derive(Insertable, Associations)]
-#[diesel(belongs_to(User))]
-#[diesel(belongs_to(Server))]
-#[diesel(table_name = members)]
-pub struct NewTrackedMember {
-    pub user_id: i64,
-    pub server_id: i64,
-}
-
 #[derive(Queryable, Identifiable, Associations, Insertable)]
 #[diesel(belongs_to(Server))]
-#[diesel(primary_key(server_id))]
+#[diesel(primary_key(channel_id))]
 #[diesel(table_name = channels)]
 pub struct Channel {
     #[diesel(column_name = channel_id)]
     pub id: i64,
     pub server_id: i64,
+}
+
+#[derive(Queryable, Identifiable, Associations, Insertable)]
+#[diesel(belongs_to(Channel))]
+#[diesel(primary_key(channel_id))]
+#[diesel(table_name = tracked_channels)]
+pub struct TrackedChannel {
+    #[diesel(column_name = channel_id)]
+    pub id: i64,
+}
+
+#[derive(Queryable, Identifiable)]
+#[diesel(primary_key(token_id))]
+#[diesel(table_name = tokens)]
+pub struct Token {
+    #[diesel(column_name = token_id)]
+    pub id: i32,
+    pub token: String,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = tokens)]
+pub struct NewToken {
+    pub token: String,
+}
+
+#[derive(Queryable, Identifiable, Insertable)]
+#[diesel(table_name = member_tokens)]
+#[diesel(primary_key(member_id, token_id, next_token_id))]
+pub struct MemberToken {
+    pub token_id: i32,
+    pub member_id: i32,
+    pub next_token_id: i32,
+    pub frequency: i64,
 }
